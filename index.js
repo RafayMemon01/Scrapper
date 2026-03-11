@@ -14,7 +14,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3500;
-const API_KEY = process.env.API_KEY || "koretechx-audit-2026";
+const API_KEY = process.env.API_KEY;
 
 // --- Auth middleware ---
 app.use((req, res, next) => {
@@ -349,9 +349,11 @@ async function fetchPageSpeed(targetUrl) {
   for (const testUrl of urlsToTry) {
     await wait(2000, 3000);
     try {
-      const apiUrl = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=" +
-        encodeURIComponent(testUrl) +
-        "&strategy=mobile&category=PERFORMANCE&category=ACCESSIBILITY&category=BEST_PRACTICES&category=SEO";
+     const psKey = process.env.PAGESPEED_API_KEY ? `&key=${process.env.PAGESPEED_API_KEY}` : "";
+const apiUrl = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=" +
+  encodeURIComponent(testUrl) +
+  "&strategy=mobile&category=PERFORMANCE&category=ACCESSIBILITY&category=BEST_PRACTICES&category=SEO" +
+  psKey;
 
       console.log("  PageSpeed testing: " + testUrl);
       const resp = await axios.get(apiUrl, { timeout: 45000 });
