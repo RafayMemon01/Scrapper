@@ -529,7 +529,8 @@ app.post("/generate/report", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("\n  Lead Audit Scraper v1.1 on port " + PORT);
+  console.log("\n  Lead Audit Scraper v1.2 on port " + PORT);
   console.log("  POST /scrape/full-audit  - Full audit");
   console.log("  GET  /health             - Health check\n");
+  console.log("  POST /generate/report     - Generate report\n");
 });
