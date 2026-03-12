@@ -8,6 +8,7 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import * as cheerio from "cheerio";
+import { generateReport } from "./report-generator.js";
 
 const app = express();
 app.use(cors());
@@ -492,6 +493,40 @@ app.post("/scrape/pagespeed", async (req, res) => {
 
 app.get("/health", (_, res) => res.json({ status: "ok", version: "1.1" }));
 app.get("/", (_, res) => res.json({ service: "Lead Audit Scraper v1.1", usage: "POST /scrape/full-audit" }));
+// REPORT GENERATOR ENDPOINT
+// Takes Claude's audit JSON, returns a branded .docx file
+// n8n calls this after getting Claude's analysis
+// ============================================================
+ 
+app.post("/generate/report", async (req, res) => {
+  try {
+    const auditData = req.body;
+    
+    if (!auditData || !auditData.lead) {
+      return res.status(400).json({ error: "Invalid audit data. Must include 'lead' object." });
+    }
+ 
+    console.log("[REPORT] Generating docx for: " + (auditData.lead.companyName || "Unknown"));
+ 
+    const buffer = await generateReport(auditData);
+ 
+    // Set headers for file download
+    const filename = (auditData.lead.companyName || "Audit")
+      .replace(/[^a-zA-Z0-9 ]/g, "")
+      .replace(/\s+/g, "_");
+ 
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}_Audit_Report.docx"`);
+    res.setHeader("Content-Length", buffer.length);
+    res.send(buffer);
+ 
+    console.log("[REPORT] Done: " + filename + "_Audit_Report.docx (" + buffer.length + " bytes)");
+ 
+  } catch (err) {
+    console.error("[REPORT] Error: " + err.message);
+    res.status(500).json({ error: "Failed to generate report: " + err.message });
+  }
+});
 
 app.listen(PORT, () => {
   console.log("\n  Lead Audit Scraper v1.1 on port " + PORT);
