@@ -9,7 +9,9 @@ import cors from "cors";
 import axios from "axios";
 import * as cheerio from "cheerio";
 import { generateReport } from "./report-generator.js";
+import dotenv from "dotenv";
 
+dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
