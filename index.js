@@ -1,6 +1,7 @@
 // ============================================================
-// LEAD AUDIT SCRAPER v1.1 - Single File Server
-// FIXES: deeper crawling, social from all pages, pagespeed retry
+// LEAD AUDIT SCRAPER v2.0 - Single File Server
+// NEW: Google Maps/GMB, Instagram, Facebook, TikTok, YouTube
+// Social: crawl-first, manual override fallback
 // Deploy to Railway.app, connect to n8n
 // ============================================================
 
@@ -8,7 +9,6 @@ import express from "express";
 import cors from "cors";
 import axios from "axios";
 import * as cheerio from "cheerio";
-import { generateReport } from "./report-generator.js";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -18,6 +18,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3500;
 const API_KEY = process.env.API_KEY;
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
 // --- Auth middleware ---
 app.use((req, res, next) => {
@@ -53,7 +54,7 @@ function clean(text) {
   return text.replace(/\s+/g, " ").trim();
 }
 
-async function fetchPage(url, retries = 2) {
+async function fetchPage(url, retries = 2, extraHeaders = {}) {
   for (let i = 0; i <= retries; i++) {
     try {
       const resp = await axios.get(url, {
@@ -67,6 +68,7 @@ async function fetchPage(url, retries = 2) {
           Connection: "keep-alive",
           "Sec-Fetch-Dest": "document",
           "Sec-Fetch-Mode": "navigate",
+          ...extraHeaders,
         },
         validateStatus: () => true,
       });
@@ -115,7 +117,6 @@ function extractInternalLinks($, pageUrl, domain) {
 
 // ============================================================
 // SCRAPER 1: WEBSITE CRAWLER (DEEP)
-// Crawls links from ALL pages, not just homepage
 // ============================================================
 
 async function scrapeWebsite(startUrl, maxPages = 15) {
@@ -237,7 +238,6 @@ function parsePage($, url, domain, isHomepage) {
 
 // ============================================================
 // SCRAPER 2: TECH STACK DETECTION
-// Checks combined HTML from ALL pages
 // ============================================================
 
 function detectTechStack(htmlArray, headers = {}) {
@@ -301,8 +301,7 @@ function detectTechStack(htmlArray, headers = {}) {
 }
 
 // ============================================================
-// SCRAPER 3: SOCIAL MEDIA FINDER
-// Checks ALL crawled pages
+// SCRAPER 3: SOCIAL MEDIA FINDER (from crawled pages)
 // ============================================================
 
 function findSocialLinks(htmlArray) {
@@ -339,7 +338,7 @@ function findSocialLinks(htmlArray) {
 }
 
 // ============================================================
-// SCRAPER 4: PAGESPEED (with retry and delay)
+// SCRAPER 4: PAGESPEED
 // ============================================================
 
 async function fetchPageSpeed(targetUrl) {
@@ -352,11 +351,11 @@ async function fetchPageSpeed(targetUrl) {
   for (const testUrl of urlsToTry) {
     await wait(2000, 3000);
     try {
-     const psKey = process.env.PAGESPEED_API_KEY ? `&key=${process.env.PAGESPEED_API_KEY}` : "";
-const apiUrl = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=" +
-  encodeURIComponent(testUrl) +
-  "&strategy=mobile&category=PERFORMANCE&category=ACCESSIBILITY&category=BEST_PRACTICES&category=SEO" +
-  psKey;
+      const psKey = process.env.PAGESPEED_API_KEY ? `&key=${process.env.PAGESPEED_API_KEY}` : "";
+      const apiUrl = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=" +
+        encodeURIComponent(testUrl) +
+        "&strategy=mobile&category=PERFORMANCE&category=ACCESSIBILITY&category=BEST_PRACTICES&category=SEO" +
+        psKey;
 
       console.log("  PageSpeed testing: " + testUrl);
       const resp = await axios.get(apiUrl, { timeout: 45000 });
@@ -423,65 +422,715 @@ function parsePageSpeed(data, testedUrl) {
 }
 
 // ============================================================
-// ENDPOINTS
+// SCRAPER 5: GOOGLE MAPS / GMB
+// Searches by company name + location
+// ============================================================
+
+async function scrapeGoogleMaps(companyName, location) {
+  const result = {
+    found: false,
+    name: null,
+    rating: null,
+    reviewCount: null,
+    category: null,
+    address: null,
+    phone: null,
+    website: null,
+    hours: null,
+    isClaimed: null,
+    hasOwnerResponses: null,
+    description: null,
+    photoCount: null,
+    error: null,
+  };
+
+  try {
+    const query = encodeURIComponent(companyName + (location ? " " + location : ""));
+    const searchUrl = "https://www.google.com/maps/search/" + query;
+
+    console.log("  Google Maps searching: " + companyName);
+    await wait(1000, 2000);
+
+    const resp = await fetchPage(searchUrl, 2, {
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.google.com/",
+    });
+
+    if (!resp || !resp.data) {
+      result.error = "Could not fetch Google Maps";
+      return result;
+    }
+
+    const html = resp.data;
+
+    // Extract rating
+    const ratingMatch = html.match(/(\d\.\d)\s*(?:stars?|out of 5|\([\d,]+\s*reviews?\))/i)
+      || html.match(/"ratingValue"\s*:\s*"?([\d.]+)"?/i)
+      || html.match(/rated\s+([\d.]+)\s+(?:out of|\/)\s*5/i);
+    if (ratingMatch) result.rating = parseFloat(ratingMatch[1]);
+
+    // Extract review count
+    const reviewMatch = html.match(/([\d,]+)\s*(?:Google\s+)?reviews?/i)
+      || html.match(/"reviewCount"\s*:\s*"?([\d,]+)"?/i);
+    if (reviewMatch) result.reviewCount = parseInt(reviewMatch[1].replace(/,/g, ""));
+
+    // Extract business name from title or structured data
+    const nameMatch = html.match(/<title>([^<]+?)\s*[-|]\s*Google Maps/i)
+      || html.match(/"name"\s*:\s*"([^"]{3,80})"/);
+    if (nameMatch) result.name = clean(nameMatch[1]);
+
+    // Extract category
+    const catMatch = html.match(/aria-label="([^"]+?)"[^>]*data-value="category"/i)
+      || html.match(/"category"\s*:\s*"([^"]+)"/i)
+      || html.match(/jslog[^>]*>\s*<span[^>]*>\s*([A-Za-z\s&]+)\s*<\/span>\s*<\/div>\s*<div[^>]*class="[^"]*rating/i);
+    if (catMatch) result.category = clean(catMatch[1]);
+
+    // Extract address
+    const addrMatch = html.match(/"streetAddress"\s*:\s*"([^"]+)"/i)
+      || html.match(/data-tooltip="Copy address"[^>]*>\s*([^<]{5,100})<\/span>/i);
+    if (addrMatch) result.address = clean(addrMatch[1]);
+
+    // Extract phone
+    const phoneMatch = html.match(/tel:([\d\s\-\+\(\)]{7,20})/i)
+      || html.match(/"telephone"\s*:\s*"([^"]+)"/i);
+    if (phoneMatch) result.phone = clean(phoneMatch[1]);
+
+    // Extract website from listing
+    const websiteMatch = html.match(/data-tooltip="Open website"[^>]*href="([^"]+)"/i)
+      || html.match(/"url"\s*:\s*"(https?:\/\/[^"]+)"/i);
+    if (websiteMatch) result.website = websiteMatch[1];
+
+    // Claimed status: unclaimed listings show "Claim this business"
+    result.isClaimed = !html.includes("Claim this business") && !html.includes("Own this business");
+
+    // Owner responses: check if "Owner" appears near review text
+    result.hasOwnerResponses = /Response from the owner|Owner's reply|replied to this review/i.test(html);
+
+    // Description
+    const descMatch = html.match(/"description"\s*:\s*"([^"]{10,500})"/i);
+    if (descMatch) result.description = clean(descMatch[1]);
+
+    // Photo count
+    const photoMatch = html.match(/([\d,]+)\s*photos?/i);
+    if (photoMatch) result.photoCount = parseInt(photoMatch[1].replace(/,/g, ""));
+
+    // Consider found if we got at least a rating or name
+    result.found = !!(result.rating || result.name || result.reviewCount);
+
+  } catch (err) {
+    result.error = "Google Maps scrape failed: " + err.message;
+  }
+
+  return result;
+}
+
+// ============================================================
+// SCRAPER 6: INSTAGRAM PUBLIC PROFILE
+// ============================================================
+
+async function scrapeInstagram(profileUrl) {
+  const result = {
+    url: profileUrl,
+    found: false,
+    username: null,
+    followers: null,
+    following: null,
+    postCount: null,
+    bio: null,
+    isVerified: false,
+    isBusinessAccount: false,
+    error: null,
+  };
+
+  if (!profileUrl) {
+    result.error = "No Instagram URL provided";
+    return result;
+  }
+
+  try {
+    // Extract username from URL
+    const usernameMatch = profileUrl.match(/instagram\.com\/([^/?#]+)/i);
+    if (usernameMatch) result.username = usernameMatch[1];
+
+    console.log("  Instagram scraping: " + (result.username || profileUrl));
+    await wait(1000, 2000);
+
+    const resp = await fetchPage(profileUrl, 2, {
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.5",
+      "Referer": "https://www.instagram.com/",
+      "Sec-Fetch-Site": "same-origin",
+    });
+
+    if (!resp || !resp.data) {
+      result.error = "Could not fetch Instagram profile";
+      return result;
+    }
+
+    const html = resp.data;
+
+    // Try extracting from meta tags first (most reliable)
+    const metaDesc = html.match(/<meta\s+(?:name|property)="description"\s+content="([^"]+)"/i)
+      || html.match(/content="([^"]+)"\s+(?:name|property)="description"/i);
+
+    if (metaDesc) {
+      const desc = metaDesc[1];
+      // Instagram meta format: "123K Followers, 456 Following, 789 Posts - See Instagram photos..."
+      const followersMatch = desc.match(/([\d,.]+[KkMm]?)\s*Followers/i);
+      const followingMatch = desc.match(/([\d,.]+[KkMm]?)\s*Following/i);
+      const postsMatch = desc.match(/([\d,.]+[KkMm]?)\s*Posts/i);
+
+      if (followersMatch) result.followers = followersMatch[1];
+      if (followingMatch) result.following = followingMatch[1];
+      if (postsMatch) result.postCount = postsMatch[1];
+    }
+
+    // Try JSON data embedded in page
+    const jsonMatch = html.match(/"edge_followed_by":\{"count":(\d+)\}/);
+    const jsonFollowMatch = html.match(/"edge_follow":\{"count":(\d+)\}/);
+    const jsonPostMatch = html.match(/"edge_owner_to_timeline_media":\{"count":(\d+)/);
+
+    if (jsonMatch) result.followers = jsonMatch[1];
+    if (jsonFollowMatch) result.following = jsonFollowMatch[1];
+    if (jsonPostMatch) result.postCount = jsonPostMatch[1];
+
+    // Bio
+    const bioMatch = html.match(/"biography":"([^"]+)"/i)
+      || html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);
+    if (bioMatch) result.bio = clean(bioMatch[1].replace(/\\n/g, " "));
+
+    // Verified
+    result.isVerified = html.includes('"is_verified":true') || html.includes("verified_icon");
+
+    // Business account
+    result.isBusinessAccount = html.includes('"is_business_account":true')
+      || html.includes('"business_category_name"');
+
+    result.found = !!(result.followers || result.postCount);
+
+  } catch (err) {
+    result.error = "Instagram scrape failed: " + err.message;
+  }
+
+  return result;
+}
+
+// ============================================================
+// SCRAPER 7: FACEBOOK PUBLIC PAGE
+// ============================================================
+
+async function scrapeFacebook(pageUrl) {
+  const result = {
+    url: pageUrl,
+    found: false,
+    pageName: null,
+    likes: null,
+    followers: null,
+    category: null,
+    about: null,
+    isVerified: false,
+    error: null,
+  };
+
+  if (!pageUrl) {
+    result.error = "No Facebook URL provided";
+    return result;
+  }
+
+  try {
+    console.log("  Facebook scraping: " + pageUrl);
+    await wait(1000, 2000);
+
+    // Use mbasic.facebook.com for simpler HTML (less JS blocking)
+    let mbasicUrl = pageUrl
+      .replace("https://www.facebook.com", "https://mbasic.facebook.com")
+      .replace("https://facebook.com", "https://mbasic.facebook.com");
+
+    const resp = await fetchPage(mbasicUrl, 2, {
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.facebook.com/",
+    });
+
+    if (!resp || !resp.data) {
+      result.error = "Could not fetch Facebook page";
+      return result;
+    }
+
+    const html = resp.data;
+    const $ = cheerio.load(html);
+
+    // Page name from title
+    const titleText = clean($("title").text());
+    if (titleText && !titleText.toLowerCase().includes("facebook")) {
+      result.pageName = titleText.replace(/\s*\|\s*Facebook.*$/i, "").trim();
+    }
+
+    // Likes and followers from meta description or page text
+    const metaDesc = $('meta[name="description"]').attr("content") || "";
+    const likesMatch = html.match(/([\d,]+)\s*(?:people\s+)?likes?/i);
+    const followersMatch = html.match(/([\d,]+)\s*(?:people\s+)?followers?/i);
+
+    if (likesMatch) result.likes = likesMatch[1];
+    if (followersMatch) result.followers = followersMatch[1];
+
+    // Category
+    const catMatch = html.match(/category[^>]*>([^<]{3,50})<\/a>/i)
+      || html.match(/"contentType"\s*:\s*"([^"]+)"/i);
+    if (catMatch) result.category = clean(catMatch[1]);
+
+    // About section
+    const aboutEl = $('[data-key="tab_about"]').text()
+      || $("div#pages_msite_body_contents").text()
+      || "";
+    if (aboutEl) result.about = clean(aboutEl).substring(0, 300);
+    if (!result.about && metaDesc) result.about = clean(metaDesc).substring(0, 300);
+
+    // Verified
+    result.isVerified = html.includes("VerifiedBadge") || html.includes("verified_account");
+
+    result.found = !!(result.pageName || result.likes || result.followers);
+
+  } catch (err) {
+    result.error = "Facebook scrape failed: " + err.message;
+  }
+
+  return result;
+}
+
+// ============================================================
+// SCRAPER 8: TIKTOK PUBLIC PROFILE
+// ============================================================
+
+async function scrapeTikTok(profileUrl) {
+  const result = {
+    url: profileUrl,
+    found: false,
+    username: null,
+    displayName: null,
+    followers: null,
+    following: null,
+    totalLikes: null,
+    bio: null,
+    isVerified: false,
+    error: null,
+  };
+
+  if (!profileUrl) {
+    result.error = "No TikTok URL provided";
+    return result;
+  }
+
+  try {
+    const usernameMatch = profileUrl.match(/tiktok\.com\/@([^/?#]+)/i);
+    if (usernameMatch) result.username = usernameMatch[1];
+
+    console.log("  TikTok scraping: " + (result.username || profileUrl));
+    await wait(1500, 2500);
+
+    const resp = await fetchPage(profileUrl, 2, {
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.5",
+      "Referer": "https://www.tiktok.com/",
+    });
+
+    if (!resp || !resp.data) {
+      result.error = "Could not fetch TikTok profile";
+      return result;
+    }
+
+    const html = resp.data;
+
+    // TikTok embeds user data in __UNIVERSAL_DATA__ or __NEXT_DATA__
+    const universalMatch = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>({.+?})<\/script>/s)
+      || html.match(/window\.__INIT_PROPS__\s*=\s*({.+?});<\/script>/s);
+
+    if (universalMatch) {
+      try {
+        const jsonData = JSON.parse(universalMatch[1]);
+        // Navigate TikTok's nested structure
+        const userInfo = jsonData?.["__DEFAULT_SCOPE__"]?.["webapp.user-detail"]?.userInfo
+          || jsonData?.userInfo
+          || jsonData?.user;
+
+        if (userInfo) {
+          const stats = userInfo.stats || userInfo.statsV2 || {};
+          const user = userInfo.user || userInfo;
+
+          result.displayName = user.nickname || user.displayName || null;
+          result.bio = clean(user.signature || user.bio || "");
+          result.isVerified = user.verified || false;
+          result.followers = stats.followerCount || stats.fans || null;
+          result.following = stats.followingCount || null;
+          result.totalLikes = stats.heartCount || stats.heart || stats.diggCount || null;
+        }
+      } catch {}
+    }
+
+    // Fallback: meta tag parsing
+    if (!result.followers) {
+      const metaDesc = html.match(/<meta\s+(?:name|property)="description"\s+content="([^"]+)"/i);
+      if (metaDesc) {
+        const desc = metaDesc[1];
+        const followersMatch = desc.match(/([\d,.]+[KkMm]?)\s*Followers/i);
+        const likesMatch = desc.match(/([\d,.]+[KkMm]?)\s*Likes/i);
+        if (followersMatch) result.followers = followersMatch[1];
+        if (likesMatch) result.totalLikes = likesMatch[1];
+      }
+    }
+
+    // Display name from og:title
+    if (!result.displayName) {
+      const ogTitle = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
+      if (ogTitle) result.displayName = clean(ogTitle[1].replace(/\(@[^)]+\)/g, "").replace(/\s*-\s*TikTok.*$/i, ""));
+    }
+
+    result.found = !!(result.followers || result.displayName);
+
+  } catch (err) {
+    result.error = "TikTok scrape failed: " + err.message;
+  }
+
+  return result;
+}
+
+// ============================================================
+// SCRAPER 9: YOUTUBE CHANNEL (via free YouTube Data API v3)
+// Env var required: YOUTUBE_API_KEY
+// ============================================================
+
+async function scrapeYouTube(channelUrl) {
+  const result = {
+    url: channelUrl,
+    found: false,
+    channelName: null,
+    subscribers: null,
+    totalViews: null,
+    videoCount: null,
+    description: null,
+    country: null,
+    publishedAt: null,
+    error: null,
+  };
+
+  if (!channelUrl) {
+    result.error = "No YouTube URL provided";
+    return result;
+  }
+
+  try {
+    console.log("  YouTube scraping: " + channelUrl);
+
+    // First try to get channel ID from the URL directly
+    let channelId = null;
+    let handle = null;
+
+    const channelIdMatch = channelUrl.match(/youtube\.com\/channel\/(UC[a-zA-Z0-9_-]{22})/i);
+    const handleMatch = channelUrl.match(/youtube\.com\/@([^/?#]+)/i);
+    const customMatch = channelUrl.match(/youtube\.com\/c\/([^/?#]+)/i)
+      || channelUrl.match(/youtube\.com\/user\/([^/?#]+)/i);
+
+    if (channelIdMatch) {
+      channelId = channelIdMatch[1];
+    } else if (handleMatch) {
+      handle = handleMatch[1];
+    } else if (customMatch) {
+      handle = customMatch[1];
+    }
+
+    // If we have an API key, use YouTube Data API
+    if (YOUTUBE_API_KEY) {
+      // Resolve handle to channel ID if needed
+      if (!channelId && handle) {
+        const searchResp = await axios.get(
+          "https://www.googleapis.com/youtube/v3/search", {
+            params: {
+              part: "snippet",
+              q: handle,
+              type: "channel",
+              maxResults: 1,
+              key: YOUTUBE_API_KEY,
+            },
+            timeout: 10000,
+          }
+        );
+        if (searchResp.data?.items?.[0]) {
+          channelId = searchResp.data.items[0].snippet.channelId;
+        }
+      }
+
+      if (channelId) {
+        const statsResp = await axios.get(
+          "https://www.googleapis.com/youtube/v3/channels", {
+            params: {
+              part: "snippet,statistics",
+              id: channelId,
+              key: YOUTUBE_API_KEY,
+            },
+            timeout: 10000,
+          }
+        );
+
+        const channel = statsResp.data?.items?.[0];
+        if (channel) {
+          const snippet = channel.snippet || {};
+          const stats = channel.statistics || {};
+
+          result.channelName = snippet.title || null;
+          result.description = clean((snippet.description || "").substring(0, 300));
+          result.country = snippet.country || null;
+          result.publishedAt = snippet.publishedAt || null;
+          result.subscribers = stats.hiddenSubscriberCount ? "Hidden" : (stats.subscriberCount || null);
+          result.totalViews = stats.viewCount || null;
+          result.videoCount = stats.videoCount || null;
+          result.found = true;
+          return result;
+        }
+      }
+    }
+
+    // Fallback: scrape the page HTML (no API key needed)
+    await wait(1000, 2000);
+    const resp = await fetchPage(channelUrl, 2, {
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.youtube.com/",
+    });
+
+    if (!resp || !resp.data) {
+      result.error = "Could not fetch YouTube channel";
+      return result;
+    }
+
+    const html = resp.data;
+
+    // Channel name from meta
+    const ogTitle = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
+    if (ogTitle) result.channelName = clean(ogTitle[1]);
+
+    // Subscriber count from page data
+    const subMatch = html.match(/"subscriberCountText":\{"simpleText":"([^"]+)"/i)
+      || html.match(/([\d,.]+[KkMm]?)\s*subscribers/i);
+    if (subMatch) result.subscribers = subMatch[1];
+
+    // Description
+    const descMatch = html.match(/"description":\{"simpleText":"([^"]+)"/i);
+    if (descMatch) result.description = clean(descMatch[1].substring(0, 300));
+
+    // Video count
+    const videoMatch = html.match(/"videoCountText":\{"runs":\[\{"text":"(\d+)"/i)
+      || html.match(/([\d,]+)\s*videos/i);
+    if (videoMatch) result.videoCount = videoMatch[1];
+
+    result.found = !!(result.channelName || result.subscribers);
+
+  } catch (err) {
+    result.error = "YouTube scrape failed: " + err.message;
+  }
+
+  return result;
+}
+
+// ============================================================
+// SOCIAL PROFILE ORCHESTRATOR
+// Crawl-first, manual override fallback
+// ============================================================
+
+async function scrapeSocialProfiles(crawledSocialLinks, manualOverrides = {}) {
+  // Merge: manual overrides take priority over crawled links
+  const links = { ...crawledSocialLinks, ...manualOverrides };
+
+  console.log("\n[SOCIAL] Scraping public profiles...");
+  console.log("  Available links:", Object.keys(links).join(", ") || "none");
+
+  const results = {};
+
+  // Run all scrapers in parallel for speed
+  const tasks = [];
+
+  if (links.instagram) {
+    tasks.push(
+      scrapeInstagram(links.instagram).then((r) => { results.instagram = r; })
+    );
+  } else {
+    results.instagram = { found: false, error: "No Instagram URL found" };
+  }
+
+  if (links.facebook) {
+    tasks.push(
+      scrapeFacebook(links.facebook).then((r) => { results.facebook = r; })
+    );
+  } else {
+    results.facebook = { found: false, error: "No Facebook URL found" };
+  }
+
+  if (links.tiktok) {
+    tasks.push(
+      scrapeTikTok(links.tiktok).then((r) => { results.tiktok = r; })
+    );
+  } else {
+    results.tiktok = { found: false, error: "No TikTok URL found" };
+  }
+
+  if (links.youtube) {
+    tasks.push(
+      scrapeYouTube(links.youtube).then((r) => { results.youtube = r; })
+    );
+  } else {
+    results.youtube = { found: false, error: "No YouTube URL found" };
+  }
+
+  await Promise.all(tasks);
+
+  const profilesFound = Object.values(results).filter((r) => r.found).length;
+  console.log("  Social profiles scraped: " + profilesFound + "/" + Object.keys(results).length);
+
+  return results;
+}
+
+// ============================================================
+// MAIN ENDPOINT: FULL AUDIT v2
 // ============================================================
 
 app.post("/scrape/full-audit", async (req, res) => {
-  const { url, companyName } = req.body;
+  const { url, companyName, location, socialOverrides } = req.body;
+
+  // url and companyName are required; location and socialOverrides are optional
   if (!url || !companyName) {
     return res.status(400).json({ error: "Both url and companyName are required" });
   }
 
   console.log("\n" + "=".repeat(50));
   console.log("[AUDIT] Starting: " + companyName + " (" + url + ")");
+  if (location) console.log("[AUDIT] Location: " + location);
   console.log("=".repeat(50));
   const startTime = Date.now();
 
   try {
-    console.log("\n[1/3] Crawling website...");
+    // STEP 1: Website crawl
+    console.log("\n[1/5] Crawling website...");
     const websiteData = await scrapeWebsite(url, 15);
 
+    // STEP 2: Tech stack + social link detection
     let techData = { technologies: [], seoChecks: {} };
-    let socialData = { found: {}, missing: [], totalFound: 0 };
+    let crawledSocialLinks = {};
     const htmlPages = websiteData._allHtmlPages || [];
 
     if (htmlPages.length > 0) {
-      console.log("\n[2/3] Detecting tech stack and social links...");
+      console.log("\n[2/5] Detecting tech stack and social links...");
       techData = detectTechStack(htmlPages);
-      socialData = findSocialLinks(htmlPages);
+      const socialResult = findSocialLinks(htmlPages);
+      crawledSocialLinks = socialResult.found || {};
+
+      // Attach social summary to website data
+      websiteData.socialMedia = {
+        found: socialResult.found,
+        missing: socialResult.missing,
+        totalFound: socialResult.totalFound,
+        totalChecked: socialResult.totalChecked,
+      };
     }
 
     delete websiteData._allHtmlPages;
 
-    console.log("\n[3/3] Fetching PageSpeed scores...");
+    // STEP 3: Google Maps / GMB
+    console.log("\n[3/5] Fetching Google Maps / GMB data...");
+    const googleMapsData = await scrapeGoogleMaps(companyName, location || "");
+
+    // STEP 4: Social profile scraping
+    // socialOverrides from request body allows manual URL input
+    console.log("\n[4/5] Scraping social media profiles...");
+    const socialProfilesData = await scrapeSocialProfiles(
+      crawledSocialLinks,
+      socialOverrides || {}
+    );
+
+    // STEP 5: PageSpeed
+    console.log("\n[5/5] Fetching PageSpeed scores...");
     const pageSpeedData = await fetchPageSpeed(url);
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
     console.log("\n" + "=".repeat(50));
-    console.log("[AUDIT] Done in " + elapsed + "s | " + websiteData.totalPages + " pages | " + techData.technologies.length + " techs | " + socialData.totalFound + " social");
+    console.log("[AUDIT] Done in " + elapsed + "s");
+    console.log("  Pages crawled:   " + websiteData.totalPages);
+    console.log("  Techs detected:  " + techData.technologies.length);
+    console.log("  GMB found:       " + (googleMapsData.found ? "Yes" : "No"));
+    console.log("  Social profiles: " + Object.values(socialProfilesData).filter((r) => r.found).length);
     console.log("=".repeat(50) + "\n");
 
     res.json({
       success: true,
       data: {
-        meta: { companyName, url, scrapedAt: new Date().toISOString(), durationSeconds: parseFloat(elapsed) },
+        meta: {
+          companyName,
+          url,
+          location: location || null,
+          scrapedAt: new Date().toISOString(),
+          durationSeconds: parseFloat(elapsed),
+        },
         website: websiteData,
         techStack: techData,
-        socialMedia: socialData,
+        googleMaps: googleMapsData,
+        socialProfiles: socialProfilesData,
         pageSpeed: pageSpeedData,
       },
     });
+
   } catch (err) {
     console.error("[AUDIT] Error: " + err.message);
     res.json({ success: false, error: err.message, data: null });
   }
 });
 
+// ============================================================
+// INDIVIDUAL ENDPOINTS (for testing / n8n granular use)
+// ============================================================
+
 app.post("/scrape/website", async (req, res) => {
   try {
     const data = await scrapeWebsite(req.body.url, req.body.maxPages || 15);
     delete data._allHtmlPages;
+    res.json({ success: true, data });
+  } catch (err) { res.json({ success: false, error: err.message }); }
+});
+
+app.post("/scrape/google-maps", async (req, res) => {
+  const { companyName, location } = req.body;
+  if (!companyName) return res.status(400).json({ error: "companyName is required" });
+  try {
+    const data = await scrapeGoogleMaps(companyName, location || "");
+    res.json({ success: true, data });
+  } catch (err) { res.json({ success: false, error: err.message }); }
+});
+
+app.post("/scrape/instagram", async (req, res) => {
+  if (!req.body.url) return res.status(400).json({ error: "url is required" });
+  try {
+    const data = await scrapeInstagram(req.body.url);
+    res.json({ success: true, data });
+  } catch (err) { res.json({ success: false, error: err.message }); }
+});
+
+app.post("/scrape/facebook", async (req, res) => {
+  if (!req.body.url) return res.status(400).json({ error: "url is required" });
+  try {
+    const data = await scrapeFacebook(req.body.url);
+    res.json({ success: true, data });
+  } catch (err) { res.json({ success: false, error: err.message }); }
+});
+
+app.post("/scrape/tiktok", async (req, res) => {
+  if (!req.body.url) return res.status(400).json({ error: "url is required" });
+  try {
+    const data = await scrapeTikTok(req.body.url);
+    res.json({ success: true, data });
+  } catch (err) { res.json({ success: false, error: err.message }); }
+});
+
+app.post("/scrape/youtube", async (req, res) => {
+  if (!req.body.url) return res.status(400).json({ error: "url is required" });
+  try {
+    const data = await scrapeYouTube(req.body.url);
     res.json({ success: true, data });
   } catch (err) { res.json({ success: false, error: err.message }); }
 });
@@ -493,46 +1142,68 @@ app.post("/scrape/pagespeed", async (req, res) => {
   } catch (err) { res.json({ success: false, error: err.message }); }
 });
 
-app.get("/health", (_, res) => res.json({ status: "ok", version: "1.1" }));
-app.get("/", (_, res) => res.json({ service: "Lead Audit Scraper v1.1", usage: "POST /scrape/full-audit" }));
-// REPORT GENERATOR ENDPOINT
-// Takes Claude's audit JSON, returns a branded .docx file
-// n8n calls this after getting Claude's analysis
 // ============================================================
- 
+// REPORT GENERATOR ENDPOINT
+// ============================================================
+
 app.post("/generate/report", async (req, res) => {
   try {
     const auditData = req.body;
-    
     if (!auditData || !auditData.lead) {
       return res.status(400).json({ error: "Invalid audit data. Must include 'lead' object." });
     }
- 
+
     console.log("[REPORT] Generating docx for: " + (auditData.lead.companyName || "Unknown"));
- 
+
+    const { generateReport } = await import("./report-generator.js");
     const buffer = await generateReport(auditData);
- 
-    // Set headers for file download
+
     const filename = (auditData.lead.companyName || "Audit")
       .replace(/[^a-zA-Z0-9 ]/g, "")
       .replace(/\s+/g, "_");
- 
+
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}_Audit_Report.docx"`);
     res.setHeader("Content-Length", buffer.length);
     res.send(buffer);
- 
+
     console.log("[REPORT] Done: " + filename + "_Audit_Report.docx (" + buffer.length + " bytes)");
- 
+
   } catch (err) {
     console.error("[REPORT] Error: " + err.message);
     res.status(500).json({ error: "Failed to generate report: " + err.message });
   }
 });
 
+// ============================================================
+// HEALTH
+// ============================================================
+
+app.get("/health", (_, res) => res.json({
+  status: "ok",
+  version: "2.0",
+  youtube_api: YOUTUBE_API_KEY ? "configured" : "not configured (fallback active)",
+}));
+
+app.get("/", (_, res) => res.json({
+  service: "Lead Audit Scraper v2.0",
+  endpoints: {
+    "POST /scrape/full-audit": "Full audit (website + GMB + social + pagespeed)",
+    "POST /scrape/google-maps": "Google Maps / GMB only",
+    "POST /scrape/instagram": "Instagram profile only",
+    "POST /scrape/facebook": "Facebook page only",
+    "POST /scrape/tiktok": "TikTok profile only",
+    "POST /scrape/youtube": "YouTube channel only",
+    "POST /scrape/website": "Website crawl only",
+    "POST /scrape/pagespeed": "PageSpeed only",
+    "POST /generate/report": "Generate audit report docx",
+  },
+}));
+
 app.listen(PORT, () => {
-  console.log("\n  Lead Audit Scraper v1.2 on port " + PORT);
-  console.log("  POST /scrape/full-audit  - Full audit");
-  console.log("  GET  /health             - Health check\n");
-  console.log("  POST /generate/report     - Generate report\n");
+  console.log("\n  Lead Audit Scraper v2.0 on port " + PORT);
+  console.log("  POST /scrape/full-audit  - Full audit (all sources)");
+  console.log("  GET  /health             - Health check");
+  console.log("  POST /generate/report    - Generate report");
+  console.log("  YouTube API:             " + (YOUTUBE_API_KEY ? "Configured" : "Not configured (HTML fallback active)") + "\n");
 });
